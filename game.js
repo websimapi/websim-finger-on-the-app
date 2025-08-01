@@ -3,267 +3,261 @@ import { WebsimSocket } from 'https://esm.sh/@websim/client';
 class FingerGame {
     constructor() {
         this.room = new WebsimSocket();
+        
+        // UI Elements
+        this.touchZone = document.getElementById('touchZone');
+        this.instructionText = document.getElementById('instructionText');
+        this.livesDisplay = document.getElementById('livesDisplay');
+        this.hearts = document.getElementById('hearts');
+        this.timerDisplay = document.getElementById('timer');
+        this.gameOverModal = document.getElementById('gameOverModal');
+        this.restartBtn = document.getElementById('restartBtn');
+        this.playersContainer = document.getElementById('playersContainer');
+
+        // Game State
+        this.gameState = 'idle'; // 'idle', 'active', 'grace', 'over'
         this.isTouching = false;
         this.startTime = null;
         this.lives = 3;
-        this.gameActive = false;
-        this.heartbeatInterval = null;
-        this.lastHeartbeat = Date.now();
+        this.timerInterval = null;
         this.lifeLossTimeout = null;
         
         this.init();
     }
 
     async init() {
-        await this.room.initialize();
-        
-        // Check if mobile
         if (!this.isMobile()) {
             document.getElementById('desktopWarning').classList.remove('hidden');
             return;
         }
 
+        await this.room.initialize();
+        
         this.setupEventListeners();
         this.setupSubscriptions();
-        this.startHeartbeat();
+        this.updatePlayerList(); // Initial render
+        
+        // Set initial presence
+        this.room.updatePresence({
+            lives: this.lives,
+            startTime: null,
+            elapsedTime: 0,
+            status: 'waiting', // 'waiting', 'playing', 'eliminated'
+        });
     }
 
     isMobile() {
-        return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) || 
-               (window.innerWidth <= 768 && 'ontouchstart' in window);
+        const toMatch = [
+            /Android/i,
+            /webOS/i,
+            /iPhone/i,
+            /iPad/i,
+            /iPod/i,
+            /BlackBerry/i,
+            /Windows Phone/i
+        ];
+        
+        return toMatch.some((toMatchItem) => {
+            return navigator.userAgent.match(toMatchItem);
+        }) || ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
     }
 
     setupEventListeners() {
-        const touchZone = document.getElementById('touchZone');
-        
-        // Touch events
-        touchZone.addEventListener('touchstart', (e) => {
+        this.touchZone.addEventListener('touchstart', (e) => {
             e.preventDefault();
             this.handleTouchStart();
-        });
+        }, { passive: false });
         
-        touchZone.addEventListener('touchend', (e) => {
+        this.touchZone.addEventListener('touchend', (e) => {
             e.preventDefault();
             this.handleTouchEnd();
-        });
+        }, { passive: false });
         
-        // Restart button
-        document.getElementById('restartBtn').addEventListener('click', () => {
+        this.restartBtn.addEventListener('click', () => {
             this.restartGame();
         });
 
-        // Prevent context menu
         document.addEventListener('contextmenu', e => e.preventDefault());
     }
 
     setupSubscriptions() {
-        // Listen for room state updates
-        this.room.subscribeRoomState((state) => {
-            this.updatePlayerList(state.players || {});
-        });
-
-        // Listen for presence updates
         this.room.subscribePresence(() => {
-            this.updatePlayerList(this.room.roomState.players || {});
-        });
-
-        // Handle heartbeat requests
-        this.room.subscribePresenceUpdateRequests((request, fromClientId) => {
-            if (request.type === 'heartbeat') {
-                this.room.updatePresence({
-                    ...this.room.presence[this.room.clientId],
-                    lastHeartbeat: Date.now(),
-                    isAlive: true
-                });
-            }
+            this.updatePlayerList();
         });
     }
 
     handleTouchStart() {
-        if (!this.gameActive) {
+        if (this.gameState === 'over') return;
+
+        if (this.gameState === 'idle') {
             this.startGame();
         }
         
+        if (this.gameState === 'grace') {
+            clearTimeout(this.lifeLossTimeout);
+            this.gameState = 'active';
+            this.instructionText.textContent = 'Keep your finger down!';
+        }
+
         this.isTouching = true;
-        this.room.updatePresence({
-            isTouching: true,
-            lastHeartbeat: Date.now()
-        });
-        
-        document.getElementById('instructionText').textContent = 'Finger down!';
-        document.getElementById('touchZone').style.background = 'linear-gradient(45deg, #4ecdc4, #44a08d)';
+        this.touchZone.style.background = 'linear-gradient(45deg, #4ecdc4, #44a08d)';
+        this.room.updatePresence({ isTouching: true });
     }
 
     handleTouchEnd() {
-        if (!this.gameActive) return;
+        if (this.gameState !== 'active') return;
         
         this.isTouching = false;
-        this.loseLife();
-        
-        // 5-second grace period
+        this.gameState = 'grace';
+        this.instructionText.textContent = '5 seconds to return!';
+        this.touchZone.style.background = 'linear-gradient(45deg, #ff9a9e, #fecfef)';
+
+        this.room.updatePresence({ isTouching: false });
+
         this.lifeLossTimeout = setTimeout(() => {
-            if (!this.isTouching && this.lives > 0) {
+            if (this.gameState === 'grace') { // Check if player hasn't returned
                 this.loseLife();
             }
         }, 5000);
-        
-        this.room.updatePresence({
-            isTouching: false,
-            lives: this.lives
-        });
     }
 
     loseLife() {
+        if (this.gameState === 'over') return;
+
         this.lives--;
         this.updateHearts();
         
+        this.room.updatePresence({ lives: this.lives });
+
         if (this.lives <= 0) {
             this.endGame();
+        } else {
+            // Still in grace period after losing a life, waiting for touch
+            this.instructionText.textContent = 'You lost a life!';
+            this.lifeLossTimeout = setTimeout(() => {
+                if(this.gameState === 'grace') this.loseLife();
+            }, 5000);
         }
-        
-        this.room.updatePresence({
-            lives: this.lives
-        });
     }
 
     startGame() {
-        this.gameActive = true;
+        this.gameState = 'active';
         this.startTime = Date.now();
         this.lives = 3;
         
-        this.room.updateRoomState({
-            players: {
-                ...this.room.roomState.players,
-                [this.room.clientId]: {
-                    username: this.room.peers[this.room.clientId].username,
-                    avatarUrl: this.room.peers[this.room.clientId].avatarUrl,
-                    startTime: this.startTime,
-                    lives: this.lives,
-                    isAlive: true
-                }
-            }
+        this.instructionText.textContent = 'Keep your finger down!';
+        this.livesDisplay.classList.remove('hidden');
+        this.timerDisplay.classList.remove('hidden');
+        this.updateHearts();
+
+        this.room.updatePresence({
+            lives: this.lives,
+            startTime: this.startTime,
+            status: 'playing',
         });
         
-        this.room.updatePresence({
-            isTouching: true,
-            lives: this.lives,
-            startTime: this.startTime
-        });
+        this.timerInterval = setInterval(() => this.updateTimer(), 50);
     }
 
     endGame() {
-        this.gameActive = false;
-        clearInterval(this.heartbeatInterval);
+        this.gameState = 'over';
+        this.isTouching = false;
+        clearInterval(this.timerInterval);
         clearTimeout(this.lifeLossTimeout);
         
         const finalTime = this.formatTime(Date.now() - this.startTime);
         document.getElementById('finalTime').textContent = `You lasted: ${finalTime}`;
-        document.getElementById('gameOverModal').classList.remove('hidden');
+        this.gameOverModal.classList.remove('hidden');
         
         this.room.updatePresence({
-            isTouching: false,
-            isAlive: false
+            status: 'eliminated',
+            isTouching: false
         });
     }
 
     restartGame() {
         this.lives = 3;
         this.isTouching = false;
-        this.gameActive = false;
+        this.gameState = 'idle';
         this.startTime = null;
         
-        document.getElementById('gameOverModal').classList.add('hidden');
-        document.getElementById('instructionText').textContent = 'Touch to start';
-        document.getElementById('touchZone').style.background = 'linear-gradient(45deg, #ff6b6b, #4ecdc4)';
+        this.gameOverModal.classList.add('hidden');
+        this.instructionText.textContent = 'Touch to start';
+        this.touchZone.style.background = 'linear-gradient(45deg, #ff6b6b, #4ecdc4)';
+        this.livesDisplay.classList.add('hidden');
+        this.timerDisplay.classList.add('hidden');
+        this.timerDisplay.textContent = '00:00:00.000';
         
-        this.updateHearts();
         this.room.updatePresence({
             lives: this.lives,
-            isAlive: true,
+            status: 'waiting',
+            startTime: null,
+            elapsedTime: 0,
             isTouching: false
         });
     }
 
-    startHeartbeat() {
-        this.heartbeatInterval = setInterval(() => {
-            if (this.gameActive && this.isTouching) {
-                // Send heartbeat to all peers
-                Object.keys(this.room.peers).forEach(clientId => {
-                    if (clientId !== this.room.clientId) {
-                        this.room.requestPresenceUpdate(clientId, {
-                            type: 'heartbeat'
-                        });
-                    }
-                });
-                
-                // Update own heartbeat
-                this.room.updatePresence({
-                    lastHeartbeat: Date.now()
-                });
-            }
-        }, 1000);
-    }
-
     updateHearts() {
-        const hearts = '❤️'.repeat(this.lives) + '💔'.repeat(3 - this.lives);
-        document.getElementById('hearts').textContent = hearts;
+        this.hearts.textContent = '❤️'.repeat(this.lives) + '💔'.repeat(Math.max(0, 3 - this.lives));
     }
 
     updateTimer() {
-        if (this.startTime && this.gameActive) {
+        if (this.startTime && this.gameState === 'active') {
             const elapsed = Date.now() - this.startTime;
-            document.getElementById('timer').textContent = this.formatTime(elapsed);
+            this.timerDisplay.textContent = this.formatTime(elapsed);
+            this.room.updatePresence({ elapsedTime: elapsed });
         }
     }
 
-    updatePlayerList(players) {
-        const container = document.getElementById('playersContainer');
-        container.innerHTML = '';
+    updatePlayerList() {
+        this.playersContainer.innerHTML = '';
         
-        // Sort players by time active
-        const sortedPlayers = Object.entries(players)
-            .sort(([, a], [, b]) => a.startTime - b.startTime);
+        const players = Object.entries(this.room.presence)
+            .map(([clientId, pres]) => ({
+                clientId,
+                username: this.room.peers[clientId]?.username || 'Player',
+                avatarUrl: this.room.peers[clientId]?.avatarUrl,
+                ...pres
+            }));
+
+        const sortedPlayers = players.sort((a, b) => (b.elapsedTime || 0) - (a.elapsedTime || 0));
         
-        sortedPlayers.forEach(([clientId, player]) => {
+        sortedPlayers.forEach(player => {
             const card = document.createElement('div');
             card.className = 'player-card';
             
-            const timeActive = player.startTime ? Date.now() - player.startTime : 0;
+            const time = player.startTime ? (player.elapsedTime || 0) : 0;
             
             card.innerHTML = `
                 <img class="player-avatar" src="${player.avatarUrl}" alt="${player.username}">
                 <div class="player-info">
                     <div class="player-name">${player.username}</div>
-                    <div class="player-time">${this.formatTime(timeActive)}</div>
+                    <div class="player-time">${player.status === 'playing' ? this.formatTime(time) : 'Waiting...'}</div>
                 </div>
                 <div class="player-lives">${'❤️'.repeat(player.lives || 0)}</div>
             `;
             
-            if (!player.isAlive) {
-                card.classList.add('disconnected');
+            if (this.room.peers[player.clientId] === undefined) {
+                 card.classList.add('disconnected');
+            } else if (player.status === 'eliminated') {
+                card.classList.add('eliminated');
+                card.querySelector('.player-time').textContent = `Lasted: ${this.formatTime(time)}`;
             }
             
-            container.appendChild(card);
+            this.playersContainer.appendChild(card);
         });
     }
 
     formatTime(ms) {
-        const totalSeconds = Math.floor(ms / 1000);
+        const totalSeconds = ms / 1000;
         const hours = Math.floor(totalSeconds / 3600);
         const minutes = Math.floor((totalSeconds % 3600) / 60);
-        const seconds = totalSeconds % 60;
+        const seconds = Math.floor(totalSeconds % 60);
+        const milliseconds = Math.floor(ms % 1000);
         
-        return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+        return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${milliseconds.toString().padStart(3, '0')}`;
     }
 }
 
 // Start the game
 new FingerGame();
-
-// Update timer every second
-setInterval(() => {
-    if (window.gameInstance) {
-        window.gameInstance.updateTimer();
-    }
-}, 1000);
-
